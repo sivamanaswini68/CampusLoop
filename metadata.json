@@ -1,0 +1,7 @@
+{
+  "name": "CampusLoop",
+  "description": "Smart campus lost, found, borrow, and lend platform for college students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

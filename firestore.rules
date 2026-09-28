@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default-deny catch-all safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Hardened Global Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'google.com'
+      );
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        (request.auth.token.email == 'sivamanaswini68@gmail.com') ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // --- Entity Validation Blueprints ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'displayName', 'role']) &&
+        data.email is string && data.email.size() <= 255 &&
+        data.displayName is string && data.displayName.size() <= 100 &&
+        data.role in ['student', 'admin'];
+    }
+
+    function isValidItem(data) {
+      return data.keys().hasAll(['type', 'title', 'description', 'category', 'location', 'status', 'userId']) &&
+        data.type in ['lost', 'found', 'lend', 'borrow_request'] &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 120 &&
+        data.description is string && data.description.size() <= 2000 &&
+        data.category in ['electronics', 'books', 'clothing', 'id_cards', 'keys', 'accessories', 'sports', 'lab_equipment', 'other'] &&
+        data.location is string && data.location.size() <= 150 &&
+        data.status in ['open', 'pending', 'claimed', 'borrowed', 'returned', 'closed'] &&
+        data.userId is string && data.userId.size() <= 128;
+    }
+
+    function isValidClaim(data) {
+      return data.keys().hasAll(['itemId', 'itemTitle', 'itemType', 'ownerId', 'claimantId', 'status', 'proofOrReason']) &&
+        data.itemId is string && data.itemId.size() <= 128 &&
+        data.itemTitle is string && data.itemTitle.size() <= 120 &&
+        data.itemType in ['lost', 'found', 'lend', 'borrow_request'] &&
+        data.ownerId is string && data.ownerId.size() <= 128 &&
+        data.claimantId is string && data.claimantId.size() <= 128 &&
+        data.status in ['pending', 'approved', 'rejected', 'returned', 'cancelled'] &&
+        data.proofOrReason is string && data.proofOrReason.size() <= 1500;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['itemId', 'senderId', 'senderName', 'recipientId', 'text']) &&
+        data.itemId is string && data.itemId.size() <= 128 &&
+        data.senderId is string && data.senderId.size() <= 128 &&
+        data.senderName is string && data.senderName.size() <= 100 &&
+        data.recipientId is string && data.recipientId.size() <= 128 &&
+        data.text is string && data.text.size() >= 1 && data.text.size() <= 1000;
+    }
+
+    function isValidAnnouncement(data) {
+      return data.keys().hasAll(['title', 'message', 'urgency', 'active']) &&
+        data.title is string && data.title.size() <= 120 &&
+        data.message is string && data.message.size() <= 1000 &&
+        data.urgency in ['info', 'warning', 'alert'] &&
+        data.active is bool;
+    }
+
+    // --- Collections ---
+
+    // 1. Users
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isVerifiedUser() && isValidId(userId) && request.auth.uid == userId && isValidUser(incoming()) &&
+        (incoming().role == 'student' || isAdmin());
+      allow update: if isVerifiedUser() && isValidId(userId) && isValidUser(incoming()) && (
+        isAdmin() ||
+        (request.auth.uid == userId && incoming().role == existing().role &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'campusId', 'department', 'dormOrBuilding', 'phone', 'bio', 'updatedAt']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 2. Admins
+    match /admins/{adminId} {
+      allow read, write: if isAdmin();
+    }
+
+    // 3. Items
+    match /items/{itemId} {
+      allow read: if isSignedIn();
+      allow create: if isVerifiedUser() && isValidId(itemId) && isValidItem(incoming()) && incoming().userId == request.auth.uid;
+      allow update: if isVerifiedUser() && isValidId(itemId) && isValidItem(incoming()) && (
+        isAdmin() ||
+        (existing().userId == request.auth.uid && incoming().userId == existing().userId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'category', 'location', 'date', 'imageUrl', 'status', 'securityQuestion', 'reward', 'pickupLocation', 'borrowDurationDays', 'currentBorrowerId', 'currentBorrowerName', 'dueDate', 'updatedAt'])) ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['flagsCount', 'isFlagged', 'updatedAt'])) ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'currentBorrowerId', 'currentBorrowerName', 'dueDate', 'updatedAt']))
+      );
+      allow delete: if isSignedIn() && isValidId(itemId) && (existing().userId == request.auth.uid || isAdmin());
+
+      // Subcollection: Messages
+      match /messages/{messageId} {
+        allow read: if isSignedIn();
+        allow create: if isVerifiedUser() && isValidId(itemId) && isValidId(messageId) && isValidMessage(incoming()) && incoming().senderId == request.auth.uid;
+        allow delete: if isAdmin();
+      }
+    }
+
+    // 4. Claims & Borrow Requests
+    match /claims/{claimId} {
+      allow read: if isSignedIn() && (
+        resource.data.claimantId == request.auth.uid ||
+        resource.data.ownerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isVerifiedUser() && isValidId(claimId) && isValidClaim(incoming()) && incoming().claimantId == request.auth.uid;
+      allow update: if isVerifiedUser() && isValidId(claimId) && isValidClaim(incoming()) && (
+        isAdmin() ||
+        (existing().ownerId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'adminNote', 'updatedAt'])) ||
+        (existing().claimantId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+      );
+      allow delete: if isSignedIn() && isValidId(claimId) && (existing().claimantId == request.auth.uid || isAdmin());
+    }
+
+    // 5. Campus Announcements
+    match /announcements/{announcementId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && isValidId(announcementId) && isValidAnnouncement(incoming());
+    }
+  }
+}
